@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Concurrent Selenium sessions with proxy authentication and 2Captcha integration
-Updated to handle reCAPTCHA checkbox click and challenge solving
-"""
 import random
 import time
 import requests
@@ -99,6 +94,9 @@ class ProxySession:
 
         # Parse proxy configuration
         proxy_parts = self.proxy_config.split(':')
+        if len(proxy_parts) != 4:
+            raise ValueError(f"Invalid proxy format. Expected 'host:port:username:password', got: {self.proxy_config}")
+        
         proxy_host = proxy_parts[0]
         proxy_port = proxy_parts[1]
         proxy_username = proxy_parts[2]
@@ -114,61 +112,66 @@ class ProxySession:
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_argument('--disable-web-security')
         chrome_options.add_argument('--allow-running-insecure-content')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-extensions-file-access-check')
+        chrome_options.add_argument('--disable-extensions-http-throttling')
         chrome_options.add_argument(
             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
 
-        # Initialize driver
-        self.driver = webdriver.Chrome(options=chrome_options)
-
-        # Execute script to hide webdriver property
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        return self.driver
+        try:
+            # Initialize driver
+            self.driver = webdriver.Chrome(options=chrome_options)
+            
+            # Execute script to hide webdriver property
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            # Wait for extension to load
+            time.sleep(3)
+            
+            return self.driver
+        except Exception as e:
+            print(f"Session {self.session_id}: Error setting up driver: {str(e)}")
+            if self.extension_dir and os.path.exists(self.extension_dir):
+                try:
+                    shutil.rmtree(self.extension_dir)
+                except:
+                    pass
+            raise
 
     def verify_proxy_ip(self):
-        """Verify the proxy IP by visiting multiple IP checking services"""
-        ip_services = [
-            ("https://httpbin.org/ip", "origin"),
-            ("https://ifconfig.me/ip", "text"),
-            ("https://ipinfo.io/ip", "text"),
-            ("https://api.ipify.org?format=json", "ip")
-        ]
+        """Verify proxy IP is working"""
+        try:
+            service_url = "https://api.myip.com/"
+            print(f"Session {self.session_id}: Checking IP with {service_url}...")
+            self.driver.get(service_url)
 
-        for service_url, key_type in ip_services:
+            # Wait for page to load
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+
+            page_content = self.driver.find_element(By.TAG_NAME, "body").text.strip()
+
             try:
-                print(f"Session {self.session_id}: Checking IP with {service_url}...")
-                self.driver.get(service_url)
+                ip_data = json.loads(page_content)
+                current_ip = ip_data.get("ip", "Unknown")
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract IP from text
+                ip_match = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', page_content)
+                current_ip = ip_match.group() if ip_match else "Unknown"
 
-                # Wait for page to load
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
+            if current_ip and current_ip != "Unknown":
+                print(f"Session {self.session_id}: Current IP: {current_ip}")
+                return current_ip
+            else:
+                print(f"Session {self.session_id}: Failed to extract IP")
+                return None
 
-                page_content = self.driver.find_element(By.TAG_NAME, "body").text.strip()
-
-                if key_type == "text":
-                    current_ip = page_content
-                else:
-                    try:
-                        ip_data = json.loads(page_content)
-                        current_ip = ip_data.get(key_type, 'Unknown')
-                    except json.JSONDecodeError:
-                        # If JSON parsing fails, try to extract IP from text
-                        ip_match = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', page_content)
-                        current_ip = ip_match.group() if ip_match else 'Unknown'
-
-                if current_ip and current_ip != 'Unknown':
-                    print(f"Session {self.session_id}: Current IP: {current_ip}")
-                    return current_ip
-
-            except Exception as e:
-                print(f"Session {self.session_id}: Error with {service_url}: {str(e)}")
-                continue
-
-        print(f"Session {self.session_id}: Failed to verify IP with all services")
-        return None
+        except Exception as e:
+            print(f"Session {self.session_id}: Error verifying IP: {str(e)}")
+            return None
 
     def solve_captcha_with_2captcha(self, site_key, page_url, is_invisible=False):
         """Solve reCAPTCHA using 2Captcha's userrecaptcha method"""
@@ -188,7 +191,7 @@ class ProxySession:
                 submit_data["invisible"] = 1
 
             # Submit the captcha request
-            response = requests.post(submit_url, data=submit_data)
+            response = requests.post(submit_url, data=submit_data, timeout=30)
             result = response.json()
 
             if result.get("status") != 1:
@@ -214,18 +217,22 @@ class ProxySession:
                     "json": 1
                 }
 
-                poll_response = requests.get(get_url, params=poll_data)
-                result = poll_response.json()
+                try:
+                    poll_response = requests.get(get_url, params=poll_data, timeout=30)
+                    result = poll_response.json()
 
-                if result.get("status") == 1:
-                    captcha_solution = result.get("request")
-                    print(f"Session {self.session_id}: ✅ Captcha solved by 2Captcha!")
-                    return captcha_solution
-                elif result.get("request") == "CAPCHA_NOT_READY":
-                    print(f"Session {self.session_id}: Waiting... ({attempt + 1}/{max_attempts})")
+                    if result.get("status") == 1:
+                        captcha_solution = result.get("request")
+                        print(f"Session {self.session_id}: ✅ Captcha solved by 2Captcha!")
+                        return captcha_solution
+                    elif result.get("request") == "CAPCHA_NOT_READY":
+                        print(f"Session {self.session_id}: Waiting... ({attempt + 1}/{max_attempts})")
+                        continue
+                    else:
+                        raise Exception(f"2Captcha polling error: {result.get('error_text', 'Unknown error')}")
+                except requests.RequestException as e:
+                    print(f"Session {self.session_id}: Network error during polling: {str(e)}")
                     continue
-                else:
-                    raise Exception(f"2Captcha polling error: {result.get('error_text', 'Unknown error')}")
 
             raise Exception("Captcha solving timed out after max attempts")
 
@@ -239,15 +246,19 @@ class ProxySession:
             print(f"Session {self.session_id}: Navigating to reCAPTCHA demo...")
             self.driver.get("https://www.google.com/recaptcha/api2/demo")
 
+            # Wait for page to load
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             print(f"Session {self.session_id}: Page loaded, looking for reCAPTCHA...")
 
+            # Wait for reCAPTCHA iframe to appear
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='recaptcha/api2/anchor']"))
             )
 
+            # Get site key
+            site_key = None
             try:
                 site_key_element = self.driver.find_element(By.CSS_SELECTOR, "[data-sitekey]")
                 site_key = site_key_element.get_attribute("data-sitekey")
@@ -256,15 +267,17 @@ class ProxySession:
                 try:
                     iframe = self.driver.find_element(By.CSS_SELECTOR, "iframe[src*='recaptcha/api2/anchor']")
                     src = iframe.get_attribute("src")
-                    site_key = re.search(r'k=([^&]+)', src).group(1) if re.search(r'k=([^&]+)', src) else None
+                    site_key_match = re.search(r'k=([^&]+)', src)
+                    site_key = site_key_match.group(1) if site_key_match else None
                     print(f"Session {self.session_id}: Found site key from iframe src: {site_key}")
-                except:
-                    print(f"Session {self.session_id}: Could not find site key")
+                except Exception as e:
+                    print(f"Session {self.session_id}: Could not find site key: {str(e)}")
                     return False
 
             if not site_key:
                 raise Exception("Could not find reCAPTCHA site key")
 
+            # Click the reCAPTCHA checkbox
             print(f"Session {self.session_id}: Switching to reCAPTCHA iframe...")
             iframe = self.driver.find_element(By.CSS_SELECTOR, "iframe[src*='recaptcha/api2/anchor']")
             self.driver.switch_to.frame(iframe)
@@ -275,11 +288,16 @@ class ProxySession:
             print(f"Session {self.session_id}: Clicking reCAPTCHA checkbox...")
             checkbox.click()
 
+            # Wait a moment for response
             time.sleep(3)
             self.driver.switch_to.default_content()
 
+            # Check if challenge iframe appears
+            needs_solving = False
             try:
-                self.driver.find_element(By.CSS_SELECTOR, "iframe[src*='recaptcha/api2/bframe']")
+                WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='recaptcha/api2/bframe']"))
+                )
                 print(f"Session {self.session_id}: Challenge iframe detected - need to solve with 2Captcha")
                 needs_solving = True
             except TimeoutException:
@@ -297,17 +315,23 @@ class ProxySession:
                     raise Exception("Failed to solve captcha with 2Captcha")
 
                 print(f"Session {self.session_id}: Injecting captcha solution...")
-                self.driver.execute_script(f"""
+                
+                # Inject the solution
+                inject_script = f"""
                     const token = "{captcha_solution}";
-
+                    
+                    // Set the token in all g-recaptcha-response textareas
                     document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach(el => {{
                         el.style.display = 'block';
                         el.value = token;
                         el.innerHTML = token;
+                        
+                        // Trigger events
                         el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }});
 
+                    // Look for callback function
                     const recaptchaCallback = document.querySelector('[data-callback]');
                     if (recaptchaCallback) {{
                         const cb = recaptchaCallback.getAttribute('data-callback');
@@ -315,10 +339,26 @@ class ProxySession:
                             window[cb](token);
                         }}
                     }}
-                """)
-
+                    
+                    // Also try to call global callback if it exists
+                    if (typeof window.grecaptcha !== 'undefined' && window.grecaptcha.execute) {{
+                        try {{
+                            window.grecaptcha.execute();
+                        }} catch(e) {{
+                            console.log('Grecaptcha execute error:', e);
+                        }}
+                    }}
+                    
+                    return 'Token injected successfully';
+                """
+                
+                result = self.driver.execute_script(inject_script)
+                print(f"Session {self.session_id}: Script result: {result}")
+                
+                # Wait for the token to be processed
                 time.sleep(3)
 
+            # Try to submit the form
             try:
                 submit_button = WebDriverWait(self.driver, 10).until(
                     EC.element_to_be_clickable((By.ID, "recaptcha-demo-submit"))
@@ -326,22 +366,30 @@ class ProxySession:
                 print(f"Session {self.session_id}: Submitting form...")
                 submit_button.click()
 
-                WebDriverWait(self.driver, 10).until(
-                    lambda driver: "Verification Success" in driver.page_source or
+                # Wait for success or page change
+                WebDriverWait(self.driver, 15).until(
+                    lambda driver: ("Verification Success" in driver.page_source or
                                    "successfully" in driver.page_source.lower() or
-                                   driver.current_url != "https://www.google.com/recaptcha/api2/demo"
+                                   driver.current_url != "https://www.google.com/recaptcha/api2/demo")
                 )
 
                 print(f"Session {self.session_id}: ✅ Form submitted successfully!")
                 print(f"Session {self.session_id}: Current URL: {self.driver.current_url}")
 
-                if "Verification Success" in self.driver.page_source or "successfully" in self.driver.page_source.lower():
+                # Check for success indicators
+                page_source = self.driver.page_source.lower()
+                if ("verification success" in page_source or 
+                    "successfully" in page_source or 
+                    self.driver.current_url != "https://www.google.com/recaptcha/api2/demo"):
                     print(f"Session {self.session_id}: ✅ reCAPTCHA verification confirmed!")
                     return True
                 else:
                     print(f"Session {self.session_id}: Form submitted but verification status unclear")
                     return True
 
+            except TimeoutException:
+                print(f"Session {self.session_id}: Timeout waiting for form submission result")
+                return False
             except Exception as e:
                 print(f"Session {self.session_id}: Error submitting form: {str(e)}")
                 return False
@@ -357,6 +405,7 @@ class ProxySession:
 
             # Setup driver
             self.setup_driver()
+            print(f"Session {self.session_id}: Driver setup completed")
 
             # Verify proxy IP
             current_ip = self.verify_proxy_ip()
@@ -380,8 +429,12 @@ class ProxySession:
             print(f"Session {self.session_id}: Fatal error: {str(e)}")
             return False
         finally:
+            # Cleanup
             if self.driver:
-                self.driver.quit()
+                try:
+                    self.driver.quit()
+                except:
+                    pass
             # Cleanup extension directory
             if self.extension_dir and os.path.exists(self.extension_dir):
                 try:
@@ -393,7 +446,7 @@ class ProxySession:
 def run_concurrent_sessions():
     """Run two concurrent Selenium sessions with different proxies"""
 
-    # Proxy configurations (fixed format)
+    # Proxy configurations (format: host:port:username:password)
     proxy_configs = [
         "89.47.118.110:12323:14a9151236ead:83c4457c02",
         "185.186.62.127:12323:14a9151236ead:83c4457c02"
@@ -411,18 +464,23 @@ def run_concurrent_sessions():
 
     def run_session_thread(session):
         """Thread wrapper for session execution"""
-        results[session.session_id] = session.run_session()
+        try:
+            results[session.session_id] = session.run_session()
+        except Exception as e:
+            print(f"Thread error for {session.session_id}: {str(e)}")
+            results[session.session_id] = False
 
     # Start threads
     print("🚀 Starting concurrent sessions...")
     for session in sessions:
         thread = threading.Thread(target=run_session_thread, args=(session,))
+        thread.daemon = True  # Allow main program to exit even if threads are running
         threads.append(thread)
         thread.start()
 
     # Wait for all threads to complete
     for thread in threads:
-        thread.join()
+        thread.join(timeout=300)  # 5 minute timeout per thread
 
     # Print final results
     print("\n" + "=" * 50)
@@ -435,6 +493,8 @@ def run_concurrent_sessions():
 
     successful_sessions = sum(1 for success in results.values() if success)
     print(f"\nCompleted: {successful_sessions}/{len(sessions)} sessions successful")
+
+    return successful_sessions, len(sessions)
 
 
 if __name__ == "__main__":
@@ -463,6 +523,10 @@ if __name__ == "__main__":
     print("\nStarting in 3 seconds...")
     time.sleep(3)
 
-    run_concurrent_sessions()
-
-
+    try:
+        successful, total = run_concurrent_sessions()
+        print(f"\n🎯 Final Summary: {successful}/{total} sessions completed successfully")
+    except KeyboardInterrupt:
+        print("\n⚠️  Program interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Program error: {str(e)}")
